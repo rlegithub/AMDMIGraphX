@@ -108,13 +108,18 @@ struct parse_skip_simplified_layer_normalization
             make_op("convert", {{"target_type", migraphx::shape::float_type}}), x);
         auto x_sq = info.add_common_op("mul", float_x, float_x);
         auto rms  = info.add_instruction(make_op("reduce_mean", {{"axes", {axis}}}), x_sq);
-        rms       = info.add_instruction(make_op("convert", {{"target_type", x_dtype}}), rms);
-        auto mean = rms;
+        // Keep variance in FP32 through rsqrt: converting back to FP16 before rsqrt
+        // introduces rounding error that rsqrt amplifies, causing router logits to
+        // drift 3-10x by layer 20 and wrong expert selection (same root cause as DML bug).
+        auto mean = info.add_instruction(
+            make_op("convert", {{"target_type", x_dtype}}), rms); // FP16 mean for output only
         epsilon =
             (x_dtype == migraphx::shape::half_type and std::abs(epsilon) < 1e-7) ? 1e-7 : epsilon;
-        auto eps    = info.add_literal(migraphx::literal{migraphx::shape{x_dtype}, {epsilon}});
-        rms         = info.add_common_op("add", rms, eps);
-        auto rrms   = info.add_instruction(make_op("rsqrt"), rms);
+        auto eps_f32 = info.add_literal(migraphx::literal{migraphx::shape{migraphx::shape::float_type}, {epsilon}});
+        auto rms_ep  = info.add_common_op("add", rms, eps_f32);        // FP32 + FP32
+        auto rrms_f32 = info.add_instruction(make_op("rsqrt"), rms_ep); // rsqrt in FP32
+        auto rrms = info.add_instruction(
+            make_op("convert", {{"target_type", x_dtype}}), rrms_f32); // back to FP16
         auto result = info.add_common_op("mul", x, rrms);
         result      = info.add_common_op("mul", result, gamma);
         if(args.size() == 4)
