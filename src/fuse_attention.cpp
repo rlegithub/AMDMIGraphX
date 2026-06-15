@@ -867,11 +867,13 @@ struct find_kv_cache_attention
         //   exp(sink) contributes to the softmax denominator; slice drops it after.
         auto attn_prob_standard = match::skip(match::name("convert"))(
             match::softmax_input(match::skip(match::name("convert"))(mask)));
+        // Sink path: match slice(softmax(concat(any_masked_scores, ...))).
+        // Use any() for the concat arg(0) because it may be any masked-where node
+        // (window, causal), not just the specific "mask" bound above.
         auto attn_prob_sink =
             match::name("slice")(match::arg(0)(
                 match::name("softmax")(match::arg(0)(
-                    match::name("concat")(match::arg(0)(
-                        match::skip(match::name("convert"))(mask)))))));
+                    match::name("concat")(match::arg(0)(match::any()))))));
         auto attn_probabilities =
             match::any_of(attn_prob_standard, attn_prob_sink);
         auto values =
