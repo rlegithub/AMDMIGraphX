@@ -245,7 +245,7 @@ struct parse_group_query_attention : op_parser<parse_group_query_attention>
             bool is_prompt       = sequence_length > 1;
             auto window_size_lit = info.add_literal(
                 migraphx::literal{migraphx::shape{past_sl->get_shape().type(), {1}},
-                                  {is_prompt ? -local_window_size : -(local_window_size + 1)}});
+                                  {is_prompt ? -local_window_size : -(local_window_size - 1)}});
             window_size_lit = info.add_instruction(
                 migraphx::make_op("multibroadcast", {{"out_lens", bnsm}}), window_size_lit);
             auto window_comp = info.add_instruction(
