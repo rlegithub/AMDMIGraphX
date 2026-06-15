@@ -286,10 +286,15 @@ struct parse_group_query_attention : op_parser<parse_group_query_attention>
             // Concatenate sink column onto the masked scores along the key axis.
             auto ext = info.add_instruction(make_op("concat", {{"axis", 3}}), where, sink_col);
             auto sm  = info.add_instruction(make_op("softmax", {{"axis", 3}}), ext);
-            // Drop the sink column: keep [0 : max_seq_len] along axis 3.
+            // Drop the sink column: keep [0 : -1] along axis 3 (remove the appended
+            // sink column, which is always the last column at runtime regardless of T).
+            // ends=-1 (Python-style) is normalized by MIGraphX to (T+1)-1=T at runtime,
+            // keeping exactly the T score positions. Baking max_seq_len from the
+            // compile-time static shape would truncate to 1 when past_sequence_length
+            // is a dynamic (symbolic) dim that defaults to 1 during compilation.
             softmax = info.add_instruction(
                 make_op("slice",
-                        {{"axes", {3}}, {"starts", {0}}, {"ends", {static_cast<int64_t>(max_seq_len)}}}),
+                        {{"axes", {3}}, {"starts", {0}}, {"ends", {-1}}}),
                 sm);
         }
         else
