@@ -861,6 +861,7 @@ struct find_skip_simplified_layer_norm
 
     void apply(module_pass_manager& mpm, const match::matcher_result& r) const
     {
+        std::cerr << "[SLN-FUSER] Matcher fired -- creating skip_layer_norm group op\n";
         auto sln_result = r.instructions["sln_result"];
         auto rms_ep     = r.instructions["rms_ep"];
 
