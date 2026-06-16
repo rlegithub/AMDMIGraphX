@@ -123,9 +123,14 @@ struct parse_skip_simplified_layer_normalization
         // Cast gamma to FP32 so mul stays in FP32
         auto gamma_f32 = info.add_instruction(
             make_op("convert", {{"target_type", migraphx::shape::float_type}}), gamma);
-        // Compute x*rrms*gamma entirely in FP32 (float_x already FP32)
-        auto result_f32 = info.add_common_op("mul", float_x, rrms_f32);
-        result_f32      = info.add_common_op("mul", result_f32, gamma_f32);
+        // Compute x*rrms*gamma entirely in FP32 using insert_instruction (NOT add_common_op)
+        // to prevent automatic type coercion by common_shape / eliminate_convert passes
+        // from reverting the FP32 multiplies to FP16.
+        auto result_f32 = info.add_instruction(make_op("mul"), float_x, rrms_f32);
+        // gamma_f32 may need broadcasting to match result_f32 shape
+        auto gamma_bc = info.add_instruction(
+            make_op("multibroadcast", {{"out_lens", result_f32->get_shape().lens()}}), gamma_f32);
+        result_f32 = info.add_instruction(make_op("mul"), result_f32, gamma_bc);
         // Cast final result back to io_dtype
         auto rrms = info.add_instruction(
             make_op("convert", {{"target_type", x_dtype}}), rrms_f32); // kept for output slot

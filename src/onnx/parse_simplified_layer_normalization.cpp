@@ -96,8 +96,11 @@ struct parse_simplified_layer_normalization : op_parser<parse_simplified_layer_n
         auto rrms_f32 = info.add_instruction(make_op("rsqrt"), rms_ep);        // FP32
         auto scale_f32 = info.add_instruction(
             make_op("convert", {{"target_type", migraphx::shape::float_type}}), scale);
-        auto result_f32 = info.add_common_op("mul", float_x, rrms_f32);        // FP32
-        result_f32      = info.add_common_op("mul", result_f32, scale_f32);    // FP32
+        // Use insert_instruction directly to prevent add_common_op from reverting to FP16
+        auto result_f32 = info.add_instruction(make_op("mul"), float_x, rrms_f32);
+        auto scale_bc = info.add_instruction(
+            make_op("multibroadcast", {{"out_lens", result_f32->get_shape().lens()}}), scale_f32);
+        result_f32 = info.add_instruction(make_op("mul"), result_f32, scale_bc);
         auto rrms   = info.add_instruction(make_op("convert", {{"target_type", x_dtype}}), rrms_f32);
         auto result = info.add_instruction(make_op("convert", {{"target_type", x_dtype}}), result_f32);
 
