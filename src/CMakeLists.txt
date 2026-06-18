@@ -224,6 +224,7 @@ register_migraphx_ops(
     gather
     gathernd
     get_tuple_elem
+    gptoss_moe
     greater
     group
     gru
