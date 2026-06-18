@@ -22,9 +22,25 @@
  * THE SOFTWARE.
  */
 #include <migraphx/gpu/device/moe.hpp>
+#include <migraphx/errors.hpp>
 #include <hip/hip_runtime.h>
 #include <vector>
 #include <cstdint>
+#include <cstdio>
+
+// First-light diagnostics: surface HIP errors with location instead of a silent
+// segfault. (Remove / downgrade once the op is proven.)
+#define MOE_HIP_CHECK(call)                                                       \
+    do                                                                            \
+    {                                                                             \
+        hipError_t _e = (call);                                                   \
+        if(_e != hipSuccess)                                                      \
+        {                                                                         \
+            std::fprintf(stderr, "[gptoss_moe] HIP error %d (%s) at %s:%d: %s\n", \
+                         (int)_e, hipGetErrorString(_e), __FILE__, __LINE__, #call); \
+            std::fflush(stderr);                                                  \
+        }                                                                         \
+    } while(0)
 
 // Kernels ported verbatim (logic-preserving) from dml/hip_qmoe:
 //   topk_moe.h         -> moe_topk_kernel
@@ -342,9 +358,20 @@ void gptoss_moe(hipStream_t stream,
     const size_t fc2_w_stride = (size_t)N_fc2 * (inter / 8);
     const size_t fc2_s_stride = (size_t)N_fc2 * (inter / 32);
 
+    if(d_out == nullptr or d_hidden == nullptr or d_router == nullptr or d_fc1_w == nullptr or
+       d_fc2_w == nullptr)
+    {
+        std::fprintf(stderr,
+                     "[gptoss_moe] null buffer: out=%p hidden=%p router=%p fc1_w=%p fc2_w=%p\n",
+                     (void*)d_out, (void*)d_hidden, (void*)d_router, (void*)d_fc1_w,
+                     (void*)d_fc2_w);
+        std::fflush(stderr);
+        return;
+    }
+
     // zero output + expert counts
-    (void)hipMemsetAsync(d_out, 0, (size_t)S * hidden * sizeof(float), stream);
-    (void)hipMemsetAsync(d_etok_cnt, 0, (size_t)E * sizeof(int32_t), stream);
+    MOE_HIP_CHECK(hipMemsetAsync(d_out, 0, (size_t)S * hidden * sizeof(float), stream));
+    MOE_HIP_CHECK(hipMemsetAsync(d_etok_cnt, 0, (size_t)E * sizeof(int32_t), stream));
 
     // 1) routing (32 experts / top-4 specialization, matching the model)
     {
@@ -353,24 +380,44 @@ void gptoss_moe(hipStream_t stream,
         if(E == 32 and top_k == 4)
             moe_topk_kernel<32, 4><<<blocks, threads, 0, stream>>>(
                 d_router, d_topk_w, d_topk_e, d_etok_ids, d_etok_cnt, S, maxtok);
+        else
+        {
+            std::fprintf(stderr, "[gptoss_moe] unsupported E=%d top_k=%d\n", E, top_k);
+            std::fflush(stderr);
+            return;
+        }
+        MOE_HIP_CHECK(hipGetLastError());
     }
 
     // 2) host-side dispatch: read which experts each token selected.
     //    (matches the validated combined-op / microbench design)
     std::vector<int32_t> h_topk_e((size_t)S * top_k);
-    (void)hipMemcpyAsync(h_topk_e.data(),
-                         d_topk_e,
-                         (size_t)S * top_k * sizeof(int32_t),
-                         hipMemcpyDeviceToHost,
-                         stream);
-    (void)hipStreamSynchronize(stream);
+    MOE_HIP_CHECK(hipMemcpyAsync(h_topk_e.data(),
+                                 d_topk_e,
+                                 (size_t)S * top_k * sizeof(int32_t),
+                                 hipMemcpyDeviceToHost,
+                                 stream));
+    MOE_HIP_CHECK(hipStreamSynchronize(stream));
 
     // Build per-expert token lists on host (decode S is tiny; for prefill this is
-    // still cheap relative to the GEMMs).
+    // still cheap relative to the GEMMs). Guard expert ids against bad routing so
+    // a stray value can't index the vector out of bounds (segfault).
     std::vector<std::vector<int32_t>> expert_tokens(E);
     for(int s = 0; s < S; s++)
         for(int k = 0; k < top_k; k++)
-            expert_tokens[h_topk_e[(size_t)s * top_k + k]].push_back(s);
+        {
+            const int32_t eid = h_topk_e[(size_t)s * top_k + k];
+            if(eid < 0 or eid >= E)
+            {
+                std::fprintf(stderr,
+                             "[gptoss_moe] bad expert id %d at (s=%d,k=%d); routing produced "
+                             "out-of-range value (E=%d). Aborting MoE.\n",
+                             (int)eid, s, k, E);
+                std::fflush(stderr);
+                return;
+            }
+            expert_tokens[eid].push_back(s);
+        }
 
     // swiglu scratch reused per expert: [maxtok, inter]
     // (allocated by caller as expert_token_counts? no — uses a dedicated buffer)
@@ -381,7 +428,9 @@ void gptoss_moe(hipStream_t stream,
 
     // For first-light we allocate swiglu_out via hipMalloc once per call.
     float* d_swiglu = nullptr;
-    (void)hipMalloc(&d_swiglu, (size_t)maxtok * inter * sizeof(float));
+    MOE_HIP_CHECK(hipMalloc(&d_swiglu, (size_t)maxtok * inter * sizeof(float)));
+    if(d_swiglu == nullptr)
+        return;
 
     const int mm_threads = MM_WARPS_PER_BLOCK * MOE_WARP_SIZE;
     const size_t smem    = (size_t)(hidden + (hidden >> 5)) * sizeof(float);
@@ -410,10 +459,11 @@ void gptoss_moe(hipStream_t stream,
         moe_q4_accum_warp_kernel<<<g2, mm_threads, smem, stream>>>(
             d_swiglu, e_fc2_w, e_fc2_s, nullptr, d_out, d_e_tokens, d_topk_w, d_topk_e, e,
             usedBy, N_fc2, inter, top_k);
+        MOE_HIP_CHECK(hipGetLastError());
     }
 
-    (void)hipStreamSynchronize(stream);
-    (void)hipFree(d_swiglu);
+    MOE_HIP_CHECK(hipStreamSynchronize(stream));
+    MOE_HIP_CHECK(hipFree(d_swiglu));
 }
 
 } // namespace device

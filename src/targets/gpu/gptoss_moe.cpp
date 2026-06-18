@@ -32,9 +32,13 @@ namespace gpu {
 
 shape hip_gptoss_moe::compute_shape(std::vector<shape> inputs) const
 {
-    // inputs include the appended output buffer; drop it for op shape-check.
-    inputs.pop_back();
-    return op.compute_shape(inputs);
+    // After lowering, an output buffer is appended (7 inputs); before that there
+    // are the 6 op inputs. Use the first 6 either way and report the op's output
+    // shape (= hidden_states shape).
+    if(inputs.size() < 6)
+        MIGRAPHX_THROW("gpu::gptoss_moe: expected >=6 inputs, got " +
+                       std::to_string(inputs.size()));
+    return inputs.front();
 }
 
 argument
