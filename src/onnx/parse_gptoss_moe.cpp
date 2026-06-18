@@ -89,11 +89,10 @@ struct parse_gptoss_moe : op_parser<parse_gptoss_moe>
                                                  {"swiglu_limit", swiglu_limit}}),
                                         args);
 
-        // FP32 -> io_dtype on the way out
-        if(io_type != shape::float_type)
-        {
-            moe = info.add_instruction(make_op("convert", {{"target_type", io_type}}), moe);
-        }
+        // Output stays FP32 — the original decomposed MoE produced an fp32 tensor
+        // (down_proj had a Cast to fp32) feeding the next layer's SkipLayerNorm.
+        // Downcasting to fp16 here corrupted the residual/norm of every later layer.
+        (void)io_type;
         return moe;
     }
 };
