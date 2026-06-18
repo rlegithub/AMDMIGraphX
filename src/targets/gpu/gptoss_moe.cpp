@@ -83,14 +83,14 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
     // Gated input-binding probe: dump shapes + first elements of each arg the EP
     // hands us, so we can compare against the oracle's known-good bins. Enable with
     // MIGRAPHX_MOE_DUMP=1. Writes once (first call) to C:/Users/atgsc/moe_ep_inputs.txt.
-    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr)
+    static int moe_call = 0;
+    const int this_call = moe_call++;
+    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr and this_call < 2)
     {
-        static bool done = false;
-        if(not done)
         {
-            done = true;
             ctx.finish();
-            std::ofstream f("C:/Users/atgsc/moe_ep_inputs.txt");
+            const std::string tag = "_call" + std::to_string(this_call);
+            std::ofstream f("C:/Users/atgsc/moe_ep_inputs" + tag + ".txt");
             const char* names[7] = {"hidden","router","fc1_w","fc1_s","fc2_w","fc2_s","output"};
             for(int i = 0; i < 7; i++)
             {
@@ -106,7 +106,7 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
                 else if(sh.type() == shape::half_type) { auto* p = reinterpret_cast<half*>(host.data()); for(std::size_t k=0;k<n;k++) f << static_cast<float>(p[k]) << " "; }
                 f << "\n";
                 // also dump full raw bytes for offline numpy comparison
-                std::string bp = std::string("C:/Users/atgsc/moe_ep_") + names[i] + ".bin";
+                std::string bp = std::string("C:/Users/atgsc/moe_ep_") + names[i] + tag + ".bin";
                 std::ofstream bf(bp, std::ios::binary);
                 bf.write(host.data(), a.get_shape().bytes());
                 bf.close();
@@ -148,18 +148,14 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
                        etok_cnt,
                        p);
 
-    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr)
+    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr and this_call < 2)
     {
-        static bool odone = false;
-        if(not odone)
-        {
-            odone = true;
-            ctx.finish();
-            auto host = from_gpu(output);
-            std::ofstream bf("C:/Users/atgsc/moe_ep_output.bin", std::ios::binary);
-            bf.write(host.data(), output.get_shape().bytes());
-            bf.close();
-        }
+        ctx.finish();
+        auto host = from_gpu(output);
+        std::ofstream bf("C:/Users/atgsc/moe_ep_output_call" + std::to_string(this_call) + ".bin",
+                         std::ios::binary);
+        bf.write(host.data(), output.get_shape().bytes());
+        bf.close();
     }
     return output;
 }
