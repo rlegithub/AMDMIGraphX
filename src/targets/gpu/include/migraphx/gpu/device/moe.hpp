@@ -25,6 +25,7 @@
 #define MIGRAPHX_GUARD_GPU_DEVICE_MOE_HPP
 
 #include <migraphx/argument.hpp>
+#include <migraphx/gpu/device/config.hpp>
 #include <migraphx/gpu/device/visit.hpp>
 #include <hip/hip_runtime_api.h>
 
