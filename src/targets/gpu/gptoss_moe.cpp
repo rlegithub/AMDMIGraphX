@@ -25,6 +25,8 @@
 #include <migraphx/gpu/context.hpp>
 #include <migraphx/gpu/hip.hpp>
 #include <migraphx/gpu/device/moe.hpp>
+#include <migraphx/errors.hpp>
+#include <migraphx/stringutils.hpp>
 
 namespace migraphx {
 inline namespace MIGRAPHX_INLINE_NS {
@@ -44,6 +46,12 @@ shape hip_gptoss_moe::compute_shape(std::vector<shape> inputs) const
 argument
 hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>& args) const
 {
+    // First-light: throw (propagates across the DLL boundary to the runner's
+    // catch + stderr; fprintf from migraphx_device.dll does not).
+    if(args.size() != 7)
+        MIGRAPHX_THROW("gpu::gptoss_moe::compute: expected 7 args (6 inputs + output), got " +
+                       std::to_string(args.size()));
+
     const auto& hidden  = args[0];
     const auto& router  = args[1];
     const auto& fc1_w   = args[2];
@@ -51,6 +59,16 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
     const auto& fc2_w   = args[4];
     const auto& fc2_s   = args[5];
     const auto& output  = args[6];
+
+    // Surface the shapes/types we actually received so a mismatch is diagnosable.
+    auto sstr = [](const shape& s) { return s.type_string() + to_string_range(s.lens()); };
+    if(hidden.get_shape().type() != shape::float_type)
+        MIGRAPHX_THROW("gpu::gptoss_moe: hidden must be float (got " + sstr(hidden.get_shape()) +
+                       ")");
+    if(fc1_w.get_shape().type() != shape::uint32_type or
+       fc2_w.get_shape().type() != shape::uint32_type)
+        MIGRAPHX_THROW("gpu::gptoss_moe: fc weights must be uint32 (got fc1=" +
+                       sstr(fc1_w.get_shape()) + " fc2=" + sstr(fc2_w.get_shape()) + ")");
 
     const int S      = static_cast<int>(hidden.get_shape().lens()[0]);
     const int E      = op.num_experts;
