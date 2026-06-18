@@ -26,7 +26,6 @@
 
 #include <migraphx/argument.hpp>
 #include <migraphx/gpu/device/config.hpp>
-#include <migraphx/gpu/device/visit.hpp>
 #include <hip/hip_runtime_api.h>
 
 namespace migraphx {
