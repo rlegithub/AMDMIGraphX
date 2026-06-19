@@ -72,6 +72,8 @@ void MIGRAPHX_DEVICE_EXPORT gptoss_moe(hipStream_t stream,
                                        const argument& fc1_scales,    // [E,N_fc1,K/32] f32
                                        const argument& fc2_weights,   // [E,N_fc2,K/8] u32
                                        const argument& fc2_scales,    // [E,N_fc2,K/32] f32
+                                       const argument& fc1_bias,      // [E,N_fc1] f32 (gate_up_proj.bias)
+                                       const argument& fc2_bias,      // [E,N_fc2] f32 (down_proj.bias)
                                        // scratch (caller-allocated, device)
                                        const argument& topk_weights,        // [S,top_k] f32
                                        const argument& topk_expert_ids,     // [S,top_k] i32

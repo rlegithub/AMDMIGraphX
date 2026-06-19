@@ -38,11 +38,10 @@ namespace gpu {
 
 shape hip_gptoss_moe::compute_shape(std::vector<shape> inputs) const
 {
-    // After lowering, an output buffer is appended (7 inputs); before that there
-    // are the 6 op inputs. Use the first 6 either way and report the op's output
-    // shape (= hidden_states shape).
-    if(inputs.size() < 6)
-        MIGRAPHX_THROW("gpu::gptoss_moe: expected >=6 inputs, got " +
+    // After lowering, an output buffer is appended (9 inputs); before that there
+    // are the 8 op inputs. Either way report the op's output shape (= hidden shape).
+    if(inputs.size() < 8)
+        MIGRAPHX_THROW("gpu::gptoss_moe: expected >=8 inputs, got " +
                        std::to_string(inputs.size()));
     return inputs.front();
 }
@@ -52,8 +51,8 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
 {
     // First-light: throw (propagates across the DLL boundary to the runner's
     // catch + stderr; fprintf from migraphx_device.dll does not).
-    if(args.size() != 7)
-        MIGRAPHX_THROW("gpu::gptoss_moe::compute: expected 7 args (6 inputs + output), got " +
+    if(args.size() != 9)
+        MIGRAPHX_THROW("gpu::gptoss_moe::compute: expected 9 args (8 inputs + output), got " +
                        std::to_string(args.size()));
 
     const auto& hidden  = args[0];
@@ -62,7 +61,9 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
     const auto& fc1_s   = args[3];
     const auto& fc2_w   = args[4];
     const auto& fc2_s   = args[5];
-    const auto& output  = args[6];
+    const auto& fc1_b   = args[6];
+    const auto& fc2_b   = args[7];
+    const auto& output  = args[8];
 
     // Surface the shapes/types we actually received so a mismatch is diagnosable.
     auto sstr = [](const shape& s) { return s.type_string() + to_string_range(s.lens()); };
@@ -91,8 +92,8 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
             ctx.finish();
             const std::string tag = "_call" + std::to_string(this_call);
             std::ofstream f("C:/Users/atgsc/moe_ep_inputs" + tag + ".txt");
-            const char* names[7] = {"hidden","router","fc1_w","fc1_s","fc2_w","fc2_s","output"};
-            for(int i = 0; i < 7; i++)
+            const char* names[9] = {"hidden","router","fc1_w","fc1_s","fc2_w","fc2_s","fc1_b","fc2_b","output"};
+            for(int i = 0; i < 9; i++)
             {
                 const auto& a   = args[i];
                 auto host       = from_gpu(a);
@@ -142,6 +143,8 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
                        fc1_s,
                        fc2_w,
                        fc2_s,
+                       fc1_b,
+                       fc2_b,
                        topk_w,
                        topk_e,
                        etok_ids,

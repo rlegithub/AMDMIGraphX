@@ -69,7 +69,7 @@ struct gptoss_moe
 
     shape compute_shape(std::vector<shape> inputs) const
     {
-        check_shapes{inputs, *this}.has(6);
+        check_shapes{inputs, *this}.has(8);
         // Output matches hidden_states (input 0): [S, hidden], same dtype.
         return inputs.front();
     }

@@ -327,6 +327,8 @@ void gptoss_moe(hipStream_t stream,
                 const argument& fc1_scales,
                 const argument& fc2_weights,
                 const argument& fc2_scales,
+                const argument& fc1_bias,
+                const argument& fc2_bias,
                 const argument& topk_weights,
                 const argument& topk_expert_ids,
                 const argument& expert_token_ids,
@@ -340,6 +342,8 @@ void gptoss_moe(hipStream_t stream,
     auto* d_fc1_s    = reinterpret_cast<const float*>(fc1_scales.data());
     auto* d_fc2_w    = reinterpret_cast<const uint32_t*>(fc2_weights.data());
     auto* d_fc2_s    = reinterpret_cast<const float*>(fc2_scales.data());
+    auto* d_fc1_b    = reinterpret_cast<const float*>(fc1_bias.data());
+    auto* d_fc2_b    = reinterpret_cast<const float*>(fc2_bias.data());
     auto* d_topk_w   = reinterpret_cast<float*>(topk_weights.data());
     auto* d_topk_e   = reinterpret_cast<int32_t*>(topk_expert_ids.data());
     auto* d_etok_ids = reinterpret_cast<int32_t*>(expert_token_ids.data());
@@ -357,6 +361,8 @@ void gptoss_moe(hipStream_t stream,
     const size_t fc1_s_stride = (size_t)N_fc1 * (hidden / 32);
     const size_t fc2_w_stride = (size_t)N_fc2 * (inter / 8);
     const size_t fc2_s_stride = (size_t)N_fc2 * (inter / 32);
+    const size_t fc1_b_stride = (size_t)N_fc1;  // [E, N_fc1]
+    const size_t fc2_b_stride = (size_t)N_fc2;  // [E, N_fc2]
 
     if(d_out == nullptr or d_hidden == nullptr or d_router == nullptr or d_fc1_w == nullptr or
        d_fc2_w == nullptr)
@@ -447,17 +453,19 @@ void gptoss_moe(hipStream_t stream,
         const float* e_fc1_s    = d_fc1_s + (size_t)e * fc1_s_stride;
         const uint32_t* e_fc2_w = d_fc2_w + (size_t)e * fc2_w_stride;
         const float* e_fc2_s    = d_fc2_s + (size_t)e * fc2_s_stride;
+        const float* e_fc1_b    = d_fc1_b ? d_fc1_b + (size_t)e * fc1_b_stride : nullptr;
+        const float* e_fc2_b    = d_fc2_b ? d_fc2_b + (size_t)e * fc2_b_stride : nullptr;
 
-        // FC1 + SwiGLU (fused, indirect gather)
+        // FC1 + SwiGLU (fused, indirect gather) — with gate_up_proj bias
         dim3 g1((inter + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, usedBy, 1);
         moe_q4_swiglu_indirect_kernel<<<g1, mm_threads, smem, stream>>>(
-            d_hidden, d_e_tokens, e_fc1_w, e_fc1_s, nullptr, d_swiglu, usedBy, hidden, inter,
+            d_hidden, d_e_tokens, e_fc1_w, e_fc1_s, e_fc1_b, d_swiglu, usedBy, hidden, inter,
             p.swiglu_alpha, p.swiglu_beta, p.swiglu_limit);
 
-        // FC2 + weighted accumulate
+        // FC2 + weighted accumulate — with down_proj bias
         dim3 g2((N_fc2 + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, usedBy, 1);
         moe_q4_accum_warp_kernel<<<g2, mm_threads, smem, stream>>>(
-            d_swiglu, e_fc2_w, e_fc2_s, nullptr, d_out, d_e_tokens, d_topk_w, d_topk_e, e,
+            d_swiglu, e_fc2_w, e_fc2_s, e_fc2_b, d_out, d_e_tokens, d_topk_w, d_topk_e, e,
             usedBy, N_fc2, inter, top_k);
         MOE_HIP_CHECK(hipGetLastError());
     }
