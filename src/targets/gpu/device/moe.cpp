@@ -482,8 +482,13 @@ void gptoss_moe(hipStream_t stream,
         MOE_HIP_CHECK(hipGetLastError());
     }
 
-    MOE_HIP_CHECK(hipStreamSynchronize(stream));
-    // d_swiglu is persistent (see allocation above) — not freed per call.
+    // B2: no end-of-call hipStreamSynchronize. It was redundant — all kernels run
+    // on `stream`, so (a) the downstream consumer of d_out is stream-ordered after
+    // them, and (b) intra-MoE reuse of persistent d_swiglu across the 24 per-token
+    // layer calls is already barriered by the NEXT call's mid-call sync (after the
+    // routing kernel, line ~406) before d_swiglu is overwritten. Dropping this lets
+    // each layer's FC2 overlap with the next layer's host-side launch work
+    // (24 fewer device-wide stalls per token). d_swiglu is persistent (B1).
 }
 
 } // namespace device
