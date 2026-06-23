@@ -81,48 +81,45 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
     // Worst case: every token routes to top_k distinct experts.
     const int maxtok = S * top_k;
 
-    // Gated input-binding probe: dump shapes + first elements of each arg the EP
-    // hands us, so we can compare against the oracle's known-good bins. Enable with
-    // MIGRAPHX_MOE_DUMP=1. Writes once (first call) to C:/Users/atgsc/moe_ep_inputs.txt.
-    static int moe_call = 0;
-    const int this_call = moe_call++;
-    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr and this_call < 2)
-    {
-        {
-            ctx.finish();
-            const std::string tag = "_call" + std::to_string(this_call);
-            std::ofstream f("C:/Users/atgsc/moe_ep_inputs" + tag + ".txt");
-            const char* names[9] = {"hidden","router","fc1_w","fc1_s","fc2_w","fc2_s","fc1_b","fc2_b","output"};
-            for(int i = 0; i < 9; i++)
-            {
-                const auto& a   = args[i];
-                auto host       = from_gpu(a);
-                f << names[i] << " " << a.get_shape().type_string()
-                  << to_string_range(a.get_shape().lens())
-                  << " strides" << to_string_range(a.get_shape().strides()) << " first=";
-                auto sh = a.get_shape();
-                std::size_t n = std::min<std::size_t>(8, sh.elements());
-                if(sh.type() == shape::float_type) { auto* p = reinterpret_cast<float*>(host.data()); for(std::size_t k=0;k<n;k++) f << p[k] << " "; }
-                else if(sh.type() == shape::uint32_type) { auto* p = reinterpret_cast<std::uint32_t*>(host.data()); for(std::size_t k=0;k<n;k++) f << p[k] << " "; }
-                else if(sh.type() == shape::half_type) { auto* p = reinterpret_cast<half*>(host.data()); for(std::size_t k=0;k<n;k++) f << static_cast<float>(p[k]) << " "; }
-                f << "\n";
-                // also dump full raw bytes for offline numpy comparison
-                std::string bp = std::string("C:/Users/atgsc/moe_ep_") + names[i] + tag + ".bin";
-                std::ofstream bf(bp, std::ios::binary);
-                bf.write(host.data(), a.get_shape().bytes());
-                bf.close();
-            }
-            f.close();
-        }
-    }
 
-    // Scratch (device). For first-light these are allocated per call via
-    // allocate_gpu (bypasses memory_coloring; revisit with the workspace-via
-    // compile() idiom once correctness is proven).
-    auto topk_w   = allocate_gpu(shape{shape::float_type, {static_cast<std::size_t>(S), static_cast<std::size_t>(top_k)}});
-    auto topk_e   = allocate_gpu(shape{shape::int32_type, {static_cast<std::size_t>(S), static_cast<std::size_t>(top_k)}});
-    auto etok_ids = allocate_gpu(shape{shape::int32_type, {static_cast<std::size_t>(E), static_cast<std::size_t>(maxtok)}});
-    auto etok_cnt = allocate_gpu(shape{shape::int32_type, {static_cast<std::size_t>(E)}});
+    // Scratch (device). B1: persistent grow-only caches instead of a fresh
+    // allocate_gpu (= hipMalloc) on every call. The MoE op runs 24x/token; with
+    // per-call allocation that was ~5 synchronous hipMalloc/free * 24 layers =
+    // ~120 device allocs/token, each a device-wide sync point — the dominant
+    // host-dispatch cost (Phase A roofline §11). Each scratch buffer keeps its own
+    // thread_local pointer, grow-only, reused across layers and decode steps;
+    // steady decode (fixed S) allocates nothing after warmup. Wrapped as NON-OWNING
+    // arguments (argument(shape,T*)) so they are not freed on scope exit. Buffers
+    // needing init (etok_cnt, output) are explicitly zeroed inside
+    // device::gptoss_moe, so reuse across calls is correctness-neutral. Process-
+    // lifetime cache (not freed at teardown — avoids racing HIP runtime shutdown).
+    struct moe_scratch_slot
+    {
+        void* ptr      = nullptr;
+        std::size_t sz = 0;
+        void* get(std::size_t bytes)
+        {
+            if(sz < bytes)
+            {
+                if(ptr != nullptr)
+                    (void)hipFree(ptr);
+                if(hipMalloc(&ptr, bytes) != hipSuccess)
+                    MIGRAPHX_THROW("gpu::gptoss_moe: scratch hipMalloc failed");
+                sz = bytes;
+            }
+            return ptr;
+        }
+    };
+    static thread_local moe_scratch_slot s_topk_w, s_topk_e, s_etok_ids, s_etok_cnt;
+
+    shape sh_topk_w{shape::float_type, {static_cast<std::size_t>(S), static_cast<std::size_t>(top_k)}};
+    shape sh_topk_e{shape::int32_type, {static_cast<std::size_t>(S), static_cast<std::size_t>(top_k)}};
+    shape sh_etok_ids{shape::int32_type, {static_cast<std::size_t>(E), static_cast<std::size_t>(maxtok)}};
+    shape sh_etok_cnt{shape::int32_type, {static_cast<std::size_t>(E)}};
+    argument topk_w{sh_topk_w, reinterpret_cast<float*>(s_topk_w.get(sh_topk_w.bytes()))};
+    argument topk_e{sh_topk_e, reinterpret_cast<std::int32_t*>(s_topk_e.get(sh_topk_e.bytes()))};
+    argument etok_ids{sh_etok_ids, reinterpret_cast<std::int32_t*>(s_etok_ids.get(sh_etok_ids.bytes()))};
+    argument etok_cnt{sh_etok_cnt, reinterpret_cast<std::int32_t*>(s_etok_cnt.get(sh_etok_cnt.bytes()))};
 
     device::moe_params p;
     p.num_tokens            = S;
@@ -151,15 +148,6 @@ hip_gptoss_moe::compute(context& ctx, const shape&, const std::vector<argument>&
                        etok_cnt,
                        p);
 
-    if(std::getenv("MIGRAPHX_MOE_DUMP") != nullptr and this_call < 2)
-    {
-        ctx.finish();
-        auto host = from_gpu(output);
-        std::ofstream bf("C:/Users/atgsc/moe_ep_output_call" + std::to_string(this_call) + ".bin",
-                         std::ios::binary);
-        bf.write(host.data(), output.get_shape().bytes());
-        bf.close();
-    }
     return output;
 }
 

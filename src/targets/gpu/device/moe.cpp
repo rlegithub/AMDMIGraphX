@@ -432,9 +432,21 @@ void gptoss_moe(hipStream_t stream,
     // expert_token_counts? To keep the signature minimal we reuse a temporary.
     // NOTE: swiglu_out is carved from the caller's scratch via a static buffer.
 
-    // For first-light we allocate swiglu_out via hipMalloc once per call.
-    float* d_swiglu = nullptr;
-    MOE_HIP_CHECK(hipMalloc(&d_swiglu, (size_t)maxtok * inter * sizeof(float)));
+    // Persistent swiglu scratch (B1): avoid a hipMalloc/hipFree on EVERY call
+    // (24 calls/token). Grow-only, reused across layers and decode steps; after the
+    // first call (steady decode S is fixed) this allocates nothing. Intentionally
+    // not freed at teardown (process-lifetime cache; freeing at static destruction
+    // can race HIP runtime shutdown).
+    static thread_local float* d_swiglu     = nullptr;
+    static thread_local size_t d_swiglu_cap = 0;
+    const size_t swiglu_bytes = (size_t)maxtok * inter * sizeof(float);
+    if(d_swiglu_cap < swiglu_bytes)
+    {
+        if(d_swiglu != nullptr)
+            MOE_HIP_CHECK(hipFree(d_swiglu));
+        MOE_HIP_CHECK(hipMalloc(&d_swiglu, swiglu_bytes));
+        d_swiglu_cap = swiglu_bytes;
+    }
     if(d_swiglu == nullptr)
         return;
 
@@ -471,7 +483,7 @@ void gptoss_moe(hipStream_t stream,
     }
 
     MOE_HIP_CHECK(hipStreamSynchronize(stream));
-    MOE_HIP_CHECK(hipFree(d_swiglu));
+    // d_swiglu is persistent (see allocation above) — not freed per call.
 }
 
 } // namespace device
