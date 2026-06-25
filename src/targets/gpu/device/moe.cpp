@@ -146,37 +146,61 @@ __global__ void __launch_bounds__(TOPK_WARPS_PER_BLOCK* MOE_WARP_SIZE, 1) moe_to
     }
 }
 
-// ---------------- fused gather + FC1 + SwiGLU (from moe_kernels.h) ----------------
+// ============================================================================
+// E1(b) S1 — PAIRED device-side dispatch kernels (capture-enabling).
+// One grid over the compacted (token,expert) pair axis: blockIdx.z = pair,
+// pair in [0, S*top_k). token = pair/top_k, expert = topk_expert_ids[pair],
+// router_weight = topk_weights[pair] — all read on-device. NO host sync, NO
+// per-expert host loop. Inner GEMV math is identical to the kernels above
+// (rel_err 0 vs HF); only index derivation changes. swiglu uses a per-PAIR
+// slab row [S*top_k, inter] (race-free: each pair owns its row). FC2 uses
+// atomicAdd (a token's top_k pairs write the same output row concurrently).
+// ============================================================================
+
+// FC1 + SwiGLU, paired. swiglu_all is [num_pairs, intermediate_size].
 __global__ void __launch_bounds__(MM_WARPS_PER_BLOCK* MOE_WARP_SIZE, 2)
-    moe_q4_swiglu_indirect_kernel(const float* __restrict__ A,
-                                  const int32_t* __restrict__ token_ids,
-                                  const uint32_t* __restrict__ B,
-                                  const float* __restrict__ scales,
-                                  const float* __restrict__ bias,
-                                  float* __restrict__ C,
-                                  const int usedBy,
-                                  const int K,
-                                  const int intermediate_size,
-                                  const float alpha,
-                                  const float beta,
-                                  const float limit)
+    moe_q4_swiglu_paired_kernel(const float* __restrict__ A,        // [tokens, K] hidden
+                                const int32_t* __restrict__ topk_expert_ids, // [tokens*top_k]
+                                const uint32_t* __restrict__ fc1_w, // [E, N_fc1, K/8]
+                                const float* __restrict__ fc1_s,    // [E, N_fc1, K/32]
+                                const float* __restrict__ fc1_b,    // [E, N_fc1] or null
+                                float* __restrict__ swiglu_all,     // [num_pairs, inter]
+                                const int top_k,
+                                const int num_experts,
+                                const int K,
+                                const int intermediate_size,
+                                const size_t fc1_w_stride,
+                                const size_t fc1_s_stride,
+                                const float alpha,
+                                const float beta,
+                                const float limit)
 {
+    const int pair    = blockIdx.z;
+    const int token   = pair / top_k;
+    const int expert  = topk_expert_ids[pair];
     const int warp_id = threadIdx.x / MOE_WARP_SIZE;
     const int lane    = threadIdx.x % MOE_WARP_SIZE;
-    const int m       = blockIdx.y;
+
+    // Guard a stray expert id (bad routing) without a host check.
+    const bool valid = (expert >= 0 and expert < num_experts);
+
+    const uint32_t* B   = fc1_w + (size_t)(valid ? expert : 0) * fc1_w_stride;
+    const float* scales = fc1_s + (size_t)(valid ? expert : 0) * fc1_s_stride;
+    const float* bias   = fc1_b ? fc1_b + (size_t)(valid ? expert : 0) * (intermediate_size * 2)
+                                : nullptr;
+    float* C            = swiglu_all + (size_t)pair * intermediate_size;
 
     extern __shared__ float smem_A[];
-    const int token = (m < usedBy) ? token_ids[m] : 0;
     for(int i = threadIdx.x; i < K; i += blockDim.x)
-        smem_A[i + (i >> 5)] = A[token * K + i];
-    __syncthreads();
+        smem_A[i + (i >> 5)] = A[(size_t)token * K + i];
+    __syncthreads(); // uniform — guard/return is AFTER (deadlock-safe)
 
-    const int pair = blockIdx.x * MM_WARPS_PER_BLOCK + warp_id;
-    if(pair >= intermediate_size or m >= usedBy)
+    const int col = blockIdx.x * MM_WARPS_PER_BLOCK + warp_id;
+    if(col >= intermediate_size or not valid)
         return;
 
-    const int gate_row       = pair * 2;
-    const int up_row         = pair * 2 + 1;
+    const int gate_row       = col * 2;
+    const int up_row         = col * 2 + 1;
     const int K_over_8       = K >> 3;
     const int blocks_per_col = K >> 5;
 
@@ -240,37 +264,45 @@ __global__ void __launch_bounds__(MM_WARPS_PER_BLOCK* MOE_WARP_SIZE, 2)
         gate              = fminf(gate, limit);
         up                = fminf(fmaxf(up, -limit), limit);
         float sigmoid_val = 1.0f / (1.0f + expf(-alpha * gate));
-        C[m * intermediate_size + pair] = (up + beta) * gate * sigmoid_val;
+        C[col]            = (up + beta) * gate * sigmoid_val;
     }
 }
 
-// ---------------- FC2 + weighted accumulate (from moe_kernels.h) ----------------
+// FC2 + weighted accumulate, paired. atomicAdd into output[token*N + n].
 __global__ void __launch_bounds__(MM_WARPS_PER_BLOCK* MOE_WARP_SIZE, 2)
-    moe_q4_accum_warp_kernel(const float* __restrict__ A,
-                             const uint32_t* __restrict__ B,
-                             const float* __restrict__ scales,
-                             const float* __restrict__ bias,
-                             float* __restrict__ output,
-                             const int32_t* __restrict__ expert_token_ids,
-                             const float* __restrict__ topk_weights,
-                             const int32_t* __restrict__ topk_expert_ids,
-                             const int expert_idx,
-                             const int usedBy,
-                             const int N,
-                             const int K,
-                             const int top_k)
+    moe_q4_accum_paired_kernel(const float* __restrict__ swiglu_all, // [num_pairs, K=inter]
+                               const int32_t* __restrict__ topk_expert_ids, // [tokens*top_k]
+                               const float* __restrict__ topk_weights,      // [tokens*top_k]
+                               const uint32_t* __restrict__ fc2_w, // [E, N, K/8]
+                               const float* __restrict__ fc2_s,    // [E, N, K/32]
+                               const float* __restrict__ fc2_b,    // [E, N] or null
+                               float* __restrict__ output,         // [tokens, N]
+                               const int top_k,
+                               const int num_experts,
+                               const int N,
+                               const int K,
+                               const size_t fc2_w_stride,
+                               const size_t fc2_s_stride)
 {
+    const int pair    = blockIdx.z;
+    const int token   = pair / top_k;
+    const int expert  = topk_expert_ids[pair];
     const int warp_id = threadIdx.x / MOE_WARP_SIZE;
     const int lane    = threadIdx.x % MOE_WARP_SIZE;
-    const int m       = blockIdx.y;
+    const bool valid  = (expert >= 0 and expert < num_experts);
+
+    const float* A      = swiglu_all + (size_t)pair * K;
+    const uint32_t* B   = fc2_w + (size_t)(valid ? expert : 0) * fc2_w_stride;
+    const float* scales = fc2_s + (size_t)(valid ? expert : 0) * fc2_s_stride;
+    const float* bias   = fc2_b ? fc2_b + (size_t)(valid ? expert : 0) * N : nullptr;
 
     extern __shared__ float smem_A[];
     for(int i = threadIdx.x; i < K; i += blockDim.x)
-        smem_A[i + (i >> 5)] = (m < usedBy) ? A[m * K + i] : 0.0f;
-    __syncthreads();
+        smem_A[i + (i >> 5)] = A[i];
+    __syncthreads(); // uniform — guard/return is AFTER (deadlock-safe)
 
     const int n = blockIdx.x * MM_WARPS_PER_BLOCK + warp_id;
-    if(n >= N or m >= usedBy)
+    if(n >= N or not valid)
         return;
 
     const int K_over_8       = K >> 3;
@@ -303,17 +335,8 @@ __global__ void __launch_bounds__(MM_WARPS_PER_BLOCK* MOE_WARP_SIZE, 2)
     {
         if(bias)
             sum += bias[n];
-        const int token     = expert_token_ids[m];
-        float router_weight = 0.0f;
-        for(int k = 0; k < top_k; k++)
-        {
-            if(topk_expert_ids[token * top_k + k] == expert_idx)
-            {
-                router_weight = topk_weights[token * top_k + k];
-                break;
-            }
-        }
-        output[token * N + n] += router_weight * sum;
+        const float router_weight = topk_weights[pair];
+        atomicAdd(&output[(size_t)token * N + n], router_weight * sum);
     }
 }
 
@@ -395,51 +418,24 @@ void gptoss_moe(hipStream_t stream,
         MOE_HIP_CHECK(hipGetLastError());
     }
 
-    // 2) host-side dispatch: read which experts each token selected.
-    //    (matches the validated combined-op / microbench design)
-    std::vector<int32_t> h_topk_e((size_t)S * top_k);
-    MOE_HIP_CHECK(hipMemcpyAsync(h_topk_e.data(),
-                                 d_topk_e,
-                                 (size_t)S * top_k * sizeof(int32_t),
-                                 hipMemcpyDeviceToHost,
-                                 stream));
-    MOE_HIP_CHECK(hipStreamSynchronize(stream));
+    // 2) E1(b) S1 — DEVICE-SIDE COMPACTED dispatch. NO host readback, NO sync, NO
+    //    per-expert host loop. The routing kernel already wrote, for each pair
+    //    p in [0, S*top_k): topk_expert_ids[p] and topk_weights[p]. That IS the
+    //    compacted (token,expert,weight) work-list, of host-known size S*top_k.
+    //    We launch exactly 2 kernels gridded over the pair axis (blockIdx.z=pair);
+    //    each block derives token=pair/top_k, expert=topk_expert_ids[pair] on
+    //    device. This makes compute() free of host control-flow / sync, so the
+    //    decode program is hipGraph-capturable (E1(b) prerequisite). It is also
+    //    compacted (S*top_k pairs, e.g. 4 at decode) — NOT the dense maxtok*E grid
+    //    that regressed in B3. expert_token_ids/_counts are now unused by this path
+    //    (routing still computes them harmlessly).
+    const int num_pairs = S * top_k;
 
-    // Build per-expert token lists on host (decode S is tiny; for prefill this is
-    // still cheap relative to the GEMMs). Guard expert ids against bad routing so
-    // a stray value can't index the vector out of bounds (segfault).
-    std::vector<std::vector<int32_t>> expert_tokens(E);
-    for(int s = 0; s < S; s++)
-        for(int k = 0; k < top_k; k++)
-        {
-            const int32_t eid = h_topk_e[(size_t)s * top_k + k];
-            if(eid < 0 or eid >= E)
-            {
-                std::fprintf(stderr,
-                             "[gptoss_moe] bad expert id %d at (s=%d,k=%d); routing produced "
-                             "out-of-range value (E=%d). Aborting MoE.\n",
-                             (int)eid, s, k, E);
-                std::fflush(stderr);
-                return;
-            }
-            expert_tokens[eid].push_back(s);
-        }
-
-    // swiglu scratch reused per expert: [maxtok, inter]
-    // (allocated by caller as expert_token_counts? no — uses a dedicated buffer)
-    // We allocate swiglu_out lazily here from output-adjacent scratch passed via
-    // expert_token_ids? No: caller passes a separate swiglu buffer through
-    // expert_token_counts? To keep the signature minimal we reuse a temporary.
-    // NOTE: swiglu_out is carved from the caller's scratch via a static buffer.
-
-    // Persistent swiglu scratch (B1): avoid a hipMalloc/hipFree on EVERY call
-    // (24 calls/token). Grow-only, reused across layers and decode steps; after the
-    // first call (steady decode S is fixed) this allocates nothing. Intentionally
-    // not freed at teardown (process-lifetime cache; freeing at static destruction
-    // can race HIP runtime shutdown).
+    // Persistent per-PAIR swiglu slab [num_pairs, inter] (B1-style grow-only;
+    // race-free: each pair owns its row). Decode: 4*2880*4 = 46 KB.
     static thread_local float* d_swiglu     = nullptr;
     static thread_local size_t d_swiglu_cap = 0;
-    const size_t swiglu_bytes = (size_t)maxtok * inter * sizeof(float);
+    const size_t swiglu_bytes = (size_t)num_pairs * inter * sizeof(float);
     if(d_swiglu_cap < swiglu_bytes)
     {
         if(d_swiglu != nullptr)
@@ -453,42 +449,29 @@ void gptoss_moe(hipStream_t stream,
     const int mm_threads = MM_WARPS_PER_BLOCK * MOE_WARP_SIZE;
     const size_t smem    = (size_t)(hidden + (hidden >> 5)) * sizeof(float);
 
-    for(int e = 0; e < E; e++)
+    // FC1 + SwiGLU over all pairs (grid.z = num_pairs).
     {
-        const int usedBy = static_cast<int>(expert_tokens[e].size());
-        if(usedBy == 0)
-            continue;
-        // expert_token_ids for this expert already on device from the routing kernel
-        const int32_t* d_e_tokens = d_etok_ids + (size_t)e * maxtok;
+        dim3 g1((inter + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, 1,
+                static_cast<unsigned>(num_pairs));
+        moe_q4_swiglu_paired_kernel<<<g1, mm_threads, smem, stream>>>(
+            d_hidden, d_topk_e, d_fc1_w, d_fc1_s, d_fc1_b, d_swiglu, top_k, E, hidden, inter,
+            fc1_w_stride, fc1_s_stride, p.swiglu_alpha, p.swiglu_beta, p.swiglu_limit);
+        MOE_HIP_CHECK(hipGetLastError());
 
-        const uint32_t* e_fc1_w = d_fc1_w + (size_t)e * fc1_w_stride;
-        const float* e_fc1_s    = d_fc1_s + (size_t)e * fc1_s_stride;
-        const uint32_t* e_fc2_w = d_fc2_w + (size_t)e * fc2_w_stride;
-        const float* e_fc2_s    = d_fc2_s + (size_t)e * fc2_s_stride;
-        const float* e_fc1_b    = d_fc1_b ? d_fc1_b + (size_t)e * fc1_b_stride : nullptr;
-        const float* e_fc2_b    = d_fc2_b ? d_fc2_b + (size_t)e * fc2_b_stride : nullptr;
-
-        // FC1 + SwiGLU (fused, indirect gather) — with gate_up_proj bias
-        dim3 g1((inter + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, usedBy, 1);
-        moe_q4_swiglu_indirect_kernel<<<g1, mm_threads, smem, stream>>>(
-            d_hidden, d_e_tokens, e_fc1_w, e_fc1_s, e_fc1_b, d_swiglu, usedBy, hidden, inter,
-            p.swiglu_alpha, p.swiglu_beta, p.swiglu_limit);
-
-        // FC2 + weighted accumulate — with down_proj bias
-        dim3 g2((N_fc2 + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, usedBy, 1);
-        moe_q4_accum_warp_kernel<<<g2, mm_threads, smem, stream>>>(
-            d_swiglu, e_fc2_w, e_fc2_s, e_fc2_b, d_out, d_e_tokens, d_topk_w, d_topk_e, e,
-            usedBy, N_fc2, inter, top_k);
+        // FC2 + weighted accumulate over all pairs (atomicAdd; d_out pre-zeroed).
+        dim3 g2((N_fc2 + MM_WARPS_PER_BLOCK - 1) / MM_WARPS_PER_BLOCK, 1,
+                static_cast<unsigned>(num_pairs));
+        moe_q4_accum_paired_kernel<<<g2, mm_threads, smem, stream>>>(
+            d_swiglu, d_topk_e, d_topk_w, d_fc2_w, d_fc2_s, d_fc2_b, d_out, top_k, E, N_fc2, inter,
+            fc2_w_stride, fc2_s_stride);
         MOE_HIP_CHECK(hipGetLastError());
     }
 
-    // B2: no end-of-call hipStreamSynchronize. It was redundant — all kernels run
-    // on `stream`, so (a) the downstream consumer of d_out is stream-ordered after
-    // them, and (b) intra-MoE reuse of persistent d_swiglu across the 24 per-token
-    // layer calls is already barriered by the NEXT call's mid-call sync (after the
-    // routing kernel, line ~406) before d_swiglu is overwritten. Dropping this lets
-    // each layer's FC2 overlap with the next layer's host-side launch work
-    // (24 fewer device-wide stalls per token). d_swiglu is persistent (B1).
+    // E1(b) S1: compute() now issues ZERO hipStreamSynchronize and NO host
+    // control flow — the op is hipGraph-capturable. Correctness rests on
+    // single-stream in-order execution (routing -> FC1 -> FC2; downstream reads
+    // d_out on the same stream; cross-call d_swiglu reuse is ordered because
+    // call N+1's FC1 cannot start until call N's FC2 finishes on the stream).
 }
 
 } // namespace device
