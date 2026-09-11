@@ -52,6 +52,11 @@ MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_MLIR_GEG_FUSION);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_ENABLE_MLIR_CEG_FUSION);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_FLASH_DECODING_ENABLED);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_MLIR);
+// When set, skip the in-kernel int4 fusion for GEMV (decode, M==1) dots so they stay as a plain
+// fp16 gemm. Works around rocMLIR having no M==1 large-shape int4 GEMV kernel on gfx1151/APU (with
+// all BLAS backends off, an un-lowered int4 GEMV otherwise falls to the CPU reference gemm on GPU
+// memory and crashes). Prefill (M>1) is unaffected.
+MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_INT4_GEMV_FUSION);
 /**
  * @brief Declares a new MIGraphX environment variable which forces to generate
  * only specific MLIR operations.
@@ -1302,6 +1307,13 @@ struct find_pointwise_mlir
         auto ins = r.result;
 
         auto* mm = ins->module_inputs().front();
+        // For decode GEMV (M==1) with int4-GEMV fusion disabled, keep a simple dequantizelinear
+        // OUTSIDE the submodule so the mlir_op stays a plain fp16 gemm (rocMLIR has no M==1 int4
+        // kernel on gfx1151, but does handle fp16 GEMV at any shape).
+        const auto& mlir_lens = ins->get_shape().lens();
+        const bool skip_int4_gemv = enabled(MIGRAPHX_DISABLE_INT4_GEMV_FUSION{}) and
+                                    not ins->get_shape().dynamic() and mlir_lens.size() >= 2 and
+                                    mlir_lens[mlir_lens.size() - 2] == 1;
         std::vector<instruction_ref> pws;
         std::copy_if(
             ins->inputs().begin(),
@@ -1311,6 +1323,9 @@ struct find_pointwise_mlir
                 if(not match::instruction_matches(mpm.get_module(), input, supported_pointwise()))
                     return false;
                 auto* pm = input->module_inputs().front();
+                if(skip_int4_gemv and input->inputs().size() > 1 and
+                   is_simple_op(pm, {"dequantizelinear"}))
+                    return false;
                 if(input->inputs().size() > 1 and not is_simple_op(pm, {"dequantizelinear"}))
                 {
                     if(not enabled(MIGRAPHX_ENABLE_MLIR_INPUT_FUSION{}))
@@ -1358,7 +1373,13 @@ struct find_unpack_int4_mlir_op
 
     void apply(module_pass_manager& mpm, const match::matcher_result& r) const
     {
-        auto ins      = r.result;
+        auto ins = r.result;
+        // Skip in-kernel int4 for decode GEMV (M==1) when disabled: leave unpack_int4 outside so
+        // the op stays a plain fp16 gemm (rocMLIR has no M==1 large-shape int4 GEMV kernel).
+        const auto& out_lens = ins->get_shape().lens();
+        if(enabled(MIGRAPHX_DISABLE_INT4_GEMV_FUSION{}) and not ins->get_shape().dynamic() and
+           out_lens.size() >= 2 and out_lens[out_lens.size() - 2] == 1)
+            return;
         auto* mm      = ins->module_inputs().front();
         module_ref nm = mpm.create_module("int4:" + mm->name());
         nm->set_bypass();
