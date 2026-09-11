@@ -44,6 +44,11 @@ MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_FLASH_DECODING_NUM_SPLITS);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_FLASH_DECODING_MIN_CHUNK_SIZE);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_FLASH_DECODING_MAX_SPLITS);
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_FLASH_DECODING_THRESHOLD);
+// When set, do not group/fuse the decode (kv_cache) attention. The raw ops
+// (fp16 dots + softmax + mask) are then lowered individually, avoiding the
+// fused gridwise_attention_accel kernel that rocMLIR cannot compile for M==1
+// decode on gfx1151/APU. Prefill attention is unaffected.
+MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_KV_CACHE_ATTENTION_FUSION);
 
 // Helper function to get config value with priority: struct member (if not default) > env var >
 // default
@@ -1035,6 +1040,8 @@ struct find_kv_cache_attention
 
     void apply(module_pass_manager& mpm, const match::matcher_result& r) const
     {
+        if(enabled(MIGRAPHX_DISABLE_KV_CACHE_ATTENTION_FUSION{}))
+            return; // leave decode attention decomposed into raw ops
         auto total_sl = r.instructions["total_sl"];
         auto reshape  = r.result;
 

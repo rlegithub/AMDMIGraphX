@@ -57,6 +57,12 @@ MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_MLIR);
 // all BLAS backends off, an un-lowered int4 GEMV otherwise falls to the CPU reference gemm on GPU
 // memory and crashes). Prefill (M>1) is unaffected.
 MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_INT4_GEMV_FUSION);
+// When set, do NOT fuse the decode (kv_cache) attention into a single mlir_op;
+// leave it decomposed (inline_module unpacks the group -> plain fp16 gemms +
+// softmax) so it lowers without the fused gridwise_attention_accel kernel, which
+// rocMLIR cannot compile for the M==1 decode case on gfx1151. Prefill attention
+// (separate "attention" group) is unaffected.
+MIGRAPHX_DECLARE_ENV_VAR(MIGRAPHX_DISABLE_KV_CACHE_ATTENTION_FUSION);
 /**
  * @brief Declares a new MIGraphX environment variable which forces to generate
  * only specific MLIR operations.
@@ -1161,6 +1167,8 @@ struct find_mlir_kv_cache_attention_op
 
     void apply(module_pass_manager& mpm, const match::matcher_result& r) const
     {
+        if(enabled(MIGRAPHX_DISABLE_KV_CACHE_ATTENTION_FUSION{}))
+            return; // leave the group un-fused; inline_module decomposes it
         auto group   = r.result;
         auto* m_attn = group->module_inputs()[0];
         mpm.get_module().replace_instruction(
